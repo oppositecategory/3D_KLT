@@ -43,14 +43,15 @@ def estimate_isotropic_autocorrelation_1D(patch, max_d, ids):
     dists = np.array([[[i**2 + j ** 2 + k **2 for i in range(max_d+1)] for j in range(max_d+1)] for k in range(max_d+1)])
     dsquare = np.sort(np.unique(dists[dists <= max_d ** 2]))
    
-    # A distance map such that [i,j] holds the index in dsquarae
-    # of distance i**2 + j**2 
+    # A distance map such that i,j,k holds the index in dsquarae
+    # of distance i**2 + j**2 + k**2
     dist_map = distance_map(max_d, dsquare,dists.shape)
     valid_dists = np.where(dists != -1) # Relevant indicies
     
-    # An efficient way to compute the c vector
-    # we compute 1D ACF by computing the FFT of Power Spectrum, however because the signal is constant 1 the ACF counts the number of terms 
-    c = np.zeros(max_d) # c[i] holds the number of terms k1,k2,k3 such that k1**2+k2**2+k3**2 == d
+    # An efficient way to compute the number of terms k1,k2,k3 
+    # such that k1**2 + k2 ** 2 + k3 ** 2 = d 
+    # we compute the auto-correlation of the 1-constant signal and hence we count the terms
+    c = np.zeros(max_d) 
     mask = np.zeros((n,n,n))
     mask[ids] = 1 
     tmp = np.zeros((2*n+1,2*n+1,2*n+1))
@@ -95,6 +96,7 @@ def distance_map(max_d, dsquare, dists_shape):
 
 @jax.jit
 def estimate_ACF(patch):
+    # Estiming the auto-correlation function by compting the FFT of the power spectrum
     patch_fft = jnp.fft.fftn(patch)
     ACF = jnp.fft.ifftn(patch_fft * jnp.conj(patch_fft))
     return ACF 

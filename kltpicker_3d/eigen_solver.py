@@ -7,6 +7,8 @@ import scipy.integrate as integrate
 #from tqdm import tqdm
 
 def solve_eigenfunction_equation(G,N,K=150):
+  # TODO: The functio right now is adapted to integrating over [0,1] both integrals.
+  #       Needs to be updated to handle both [0,a] and [0,c] and scale the Legendre roots appropriately.
   def Hn(x):
     p = legendre(N)
     if N % 2 == 0:

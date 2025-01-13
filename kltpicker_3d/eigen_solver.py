@@ -1,14 +1,81 @@
 import numpy as np 
 import scipy
 
+import jax 
+import jax.numpy as jnp
+from jax.numpy import einsum
+
 from scipy.special import legendre
 import scipy.integrate as integrate
 
+from functools import partial
+
 #from tqdm import tqdm
 
-def solve_eigenfunction_equation(G,N,K=150):
-  # TODO: The functio right now is adapted to integrating over [0,1] both integrals.
-  #       Needs to be updated to handle both [0,a] and [0,c] and scale the Legendre roots appropriately.
+@jax.jit
+def Hn_even(x,w,p):
+  # Vectorized evaluation of Hn for different orders simultanously.  
+  hn = jnp.einsum("ijk,kl-> ijl", jnp.cos(x),p)
+  return 4* jnp.pi * jnp.sum(w*hn,axis=-1)
+   
+@jax.jit
+def Hn_odd(x,w,p):
+  hn = jnp.einsum("ijk,kl-> ijl", jnp.sin(x),p)
+  return 4* jnp.pi * jnp.sum(w*hn,axis=-1)
+
+def gpu_integral_equation_solver(G,a,c,N,K=100):
+   """ Solves the Kosambi–Karhunen–Loève integral equation up to order N. 
+
+       Args:
+        G: radial power spectrum
+        a: particle's diameter 
+        c: particle energy function's bandwidth 
+        N: the maximum order of the equation we solve for 
+
+      Returns:
+        eigenvalues: eigenvalues of the discretized integral equation up to order N 
+        eigenfunctions: the solutions of the integral equation
+   """
+   legendre_roots, w = scipy.special.roots_legendre(K)
+   legendre_roots,w = jnp.array(legendre_roots), jnp.array(w)
+
+   rho = c/2 * legendre_roots + c/2
+   r = a/2 * legendre_roots + a/2
+
+   p = jnp.array([legendre(k)(legendre_roots) for k in range(N)])
+   g_tensor = G(rho)
+
+   legendre_multiples = rho[...,None]*rho[None,...]
+   
+   even_orders = jnp.arange(2,N,2)
+   odd_orders = jnp.arange(1,N,2)
+
+   special_fn_input = jnp.einsum("ij,k->ijk",legendre_multiples,legendre_roots)
+
+   # Tensors of size N//2 x K x K 
+   special_fn_even = Hn_even(special_fn_input,w,p) 
+   special_fn_odd = Hn_odd(special_fn_input,w,p)
+
+   vv_even = special_fn_even @ special_fn_even.T
+   vv_odd = special_fn_odd @ special_fn_odd.T
+
+   vv = jnp.zeros((N,K,K))
+   vv = vv.at[even_orders].set(vv_even)
+   vv = vv.at[odd_orders].set(vv_odd)
+   
+   jacobian = jnp.einsum("i,j->ij",r,rho) ** 2
+   batched_psi_matrix = jnp.einsum(
+    "k,bij,k,ik->bij", w,vv,g_tensor,jacobian
+   )
+
+   #TODO: Re-write a batched eigendecomposition for nonsyemmtric psi
+   eigenvalues, eigenfunctions = jnp.linalg.eig(batched_psi_matrix)
+   return eigenvalues, eigenfunctions
+
+def cpu_integral_equation_solver(G,N,K=150):
+  # TODO: 
+  #   - Handle arbitrary diferent parameters a and c (particle diameter and bandwith)
+  #   - Re-write in jax to utilize it's vmap utility; one can calculate the vv matrix for different values of N simulatenosly
   def Hn(x):
     p = legendre(N)
     if N % 2 == 0:
@@ -22,7 +89,7 @@ def solve_eigenfunction_equation(G,N,K=150):
   Gx = G(X_scaled)
 
   def psi(i,j):
-    """ Function uses pre-computed evaluations of H_n at multiples of Legendre roots
+    """ Function uses pre-computed evaluations of H_n at multiples of Legendre  roots
         and evaluate the integral in a vectorized way.
     """
     return 0.5 * np.sum(w * vv[j,:] * vv[i,:] * Gx * (X_scaled[j]*X_scaled)**2)

@@ -26,7 +26,6 @@ def estimate_isotropic_powerspectrum_tensor(tomogram, ids,max_d):
 
     # Normalize the 3D power spectrum to preserve mean energy
     p3 = (p3/p3.sum())*mean_energy * p3.size
-
     p3 = jnp.where(p3 < 0, 0, p3) # Truncate negative values by 0 
     return p3
 

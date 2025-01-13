@@ -14,14 +14,23 @@ from functools import partial
 
 @jax.jit
 def Hn_even(x,w,p):
-  # Vectorized evaluation of Hn for different orders simultanously.  
-  hn = jnp.einsum("ijk,kl-> ijl", jnp.cos(x),p)
+  # Batched Gaussian quadrature to evaluate Hn at different even orders
+  hn = einsum("ijk,lk-> ijl", jnp.cos(x),p)
   return 4* jnp.pi * jnp.sum(w*hn,axis=-1)
    
 @jax.jit
 def Hn_odd(x,w,p):
-  hn = jnp.einsum("ijk,kl-> ijl", jnp.sin(x),p)
+  hn = einsum("ijk,lk-> ijl", jnp.sin(x),p)
   return 4* jnp.pi * jnp.sum(w*hn,axis=-1)
+
+@partial(jax.jit,static_argnames=['N'])
+def batched_eigdecomposition(X,N):
+    eigenvalues, eigenfunctions = [],[]
+    for i in range(N):
+        lambdas, eig_fns = jnp.linalg.eig(X[i,...])
+        eigenvalues.append(lambdas)
+        eigenfunctions.append(eig_fns)
+    return eigenvalues,eigenfunctions
 
 def gpu_integral_equation_solver(G,a,c,N,K=100):
    """ Solves the Kosambi–Karhunen–Loève integral equation up to order N. 
@@ -67,9 +76,14 @@ def gpu_integral_equation_solver(G,a,c,N,K=100):
    batched_psi_matrix = jnp.einsum(
     "k,bij,k,ik->bij", w,vv,g_tensor,jacobian
    )
-
-   #TODO: Re-write a batched eigendecomposition for nonsyemmtric psi
-   eigenvalues, eigenfunctions = jnp.linalg.eig(batched_psi_matrix)
+   
+   # As of now there's no GPU-supported eigendecomposition
+   # However as we are dealing with small matrices the cpu
+   # version is quite fast + the JIT help reduce time as we
+   # are calling it for each patch with the same number of eigenvalues
+   cpu_device = jax.devices('cpu')[0]
+   cpu_psi = jax.device_put(batched_psi_matrix,device=cpu_device)
+   eigenvalues, eigenfunctions = batched_eigdecomposition(cpu_psi)
    return eigenvalues, eigenfunctions
 
 def cpu_integral_equation_solver(G,N,K=150):

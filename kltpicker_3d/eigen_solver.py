@@ -13,15 +13,13 @@ from functools import partial
 #from tqdm import tqdm
 
 @jax.jit
-def Hn_even(x,w,p):
-  # Batched Gaussian quadrature to evaluate Hn at different even orders
-  hn = einsum("ijk,lk-> ijl", jnp.cos(x),p)
-  return 4* jnp.pi * jnp.sum(w*hn,axis=-1)
+def batched_Hn_even(x,w,p):
+  # Vectorized evaluation of Hn for different orders simultanously.  
+  return 4 * jnp.pi * einsum("ijk,bk,k->bij", jnp.cos(x),p,w)
    
 @jax.jit
-def Hn_odd(x,w,p):
-  hn = einsum("ijk,lk-> ijl", jnp.sin(x),p)
-  return 4* jnp.pi * jnp.sum(w*hn,axis=-1)
+def batched_Hn_odd(x,w,p):
+  return 4* jnp.pi * einsum("ijk,bk,k->bij", jnp.sin(x),p,w)
 
 @partial(jax.jit,static_argnames=['N'])
 def batched_eigdecomposition(X,N):
@@ -32,7 +30,8 @@ def batched_eigdecomposition(X,N):
         eigenfunctions.append(eig_fns)
     return eigenvalues,eigenfunctions
 
-def gpu_integral_equation_solver(G,a,c,N,K=100):
+
+def gpu_integral_equation_solver(G,a,c,N,K=150):
    """ Solves the Kosambi–Karhunen–Loève integral equation up to order N. 
 
        Args:
@@ -51,31 +50,40 @@ def gpu_integral_equation_solver(G,a,c,N,K=100):
    rho = c/2 * legendre_roots + c/2
    r = a/2 * legendre_roots + a/2
 
+   # NxK matrix containing Legendre polynomial over [-1,1] 
+   # for orders up to N
    p = jnp.array([legendre(k)(legendre_roots) for k in range(N)])
    g_tensor = G(rho)
 
-   legendre_multiples = rho[...,None]*rho[None,...]
+   # Multiples of inner and outer integral varaibles
+   legendre_multiples = r[...,None]*rho[None,...]
    
    even_orders = jnp.arange(2,N,2)
    odd_orders = jnp.arange(1,N,2)
+   
+   # Broadcasting the input of Hn (scaled Legendre roots multiplied) over the interval [-1,1]
+   special_fn_input = einsum("ij,k->ijk",legendre_multiples,legendre_roots)
 
-   special_fn_input = jnp.einsum("ij,k->ijk",legendre_multiples,legendre_roots)
+   p_even = p[even_orders]
+   p_odd = p[odd_orders]
 
    # Tensors of size N//2 x K x K 
-   special_fn_even = Hn_even(special_fn_input,w,p) 
-   special_fn_odd = Hn_odd(special_fn_input,w,p)
+   hn_even = batched_Hn_even(special_fn_input,w,p_even) 
+   hn_odd = batched_Hn_odd(special_fn_input,w,p_odd)
 
-   vv_even = special_fn_even @ special_fn_even.T
-   vv_odd = special_fn_odd @ special_fn_odd.T
+   # Calculates the Hn*Hn term that appears in Psi
+   # We calculate hn_even @ hn_even.T in the batched tensor
+   vv_even = jax.lax.batch_matmul(hn_even,jnp.permute_dims(hn_even,(0,2,1)))
+   vv_odd = jax.lax.batch_matmul(hn_odd,jnp.permute_dims(hn_even,(0,2,1)))
 
    vv = jnp.zeros((N,K,K))
    vv = vv.at[even_orders].set(vv_even)
    vv = vv.at[odd_orders].set(vv_odd)
    
-   jacobian = jnp.einsum("i,j->ij",r,rho) ** 2
-   batched_psi_matrix = jnp.einsum(
-    "k,bij,k,ik->bij", w,vv,g_tensor,jacobian
-   )
+
+   jacobian = einsum("i,j->ij",r,rho) ** 2
+
+   batched_psi_matrix = einsum("k,bij,k,ik->bij",w,vv,g_tensor,jacobian)
    
    # As of now there's no GPU-supported eigendecomposition
    # However as we are dealing with small matrices the cpu
@@ -83,7 +91,7 @@ def gpu_integral_equation_solver(G,a,c,N,K=100):
    # are calling it for each patch with the same number of eigenvalues
    cpu_device = jax.devices('cpu')[0]
    cpu_psi = jax.device_put(batched_psi_matrix,device=cpu_device)
-   eigenvalues, eigenfunctions = batched_eigdecomposition(cpu_psi)
+   eigenvalues, eigenfunctions = batched_eigdecomposition(cpu_psi,N)
    return eigenvalues, eigenfunctions
 
 def cpu_integral_equation_solver(G,N,K=150):
@@ -113,7 +121,7 @@ def cpu_integral_equation_solver(G,N,K=150):
   eigenvalues, eigenvectors = scipy.linalg.eig(U)
   return eigenvalues,eigenvectors
 
-# G = lambda x: np.exp(-x**2)
-
+G = lambda x: np.exp(-x**2)
+gpu_integral_equation_solver(G,1,1,100)
 # for N in tqdm(range(1,100)):
 #     x = solve_eigenfunction_equation(G,N)

@@ -10,28 +10,11 @@ import scipy.integrate as integrate
 
 from functools import partial
 
-@jax.jit
-def batched_Hn_even(x,w,p): 
-  return 4 * jnp.pi * jnp.einsum("ijk,bk,k->bij", jnp.cos(x),p,w)
-   
-@jax.jit
-def batched_Hn_odd(x,w,p):
-  return 4* jnp.pi * jnp.einsum("ijk,bk,k->bij", jnp.sin(x),p,w)
-
-@partial(jax.jit,static_argnames=['N'])
-def batched_eigdecomposition(X,N):
-    eigenvalues, eigenfunctions = [],[]
-    for i in range(N):
-        lambdas, eig_fns = jnp.linalg.eig(X[i,...])
-        eigenvalues.append(lambdas)
-        eigenfunctions.append(eig_fns)
-    return eigenvalues,eigenfunctions
-
 
 def gpu_integral_equation_solver(G,a,c,N,K=150):
    """ Solves the Kosambi–Karhunen–Loève integral equation up to order N in parallel.
 
-       Args:
+      Args:
         G: radial power spectrum
         a: particle's diameter 
         c: particle energy function's bandwidth 
@@ -59,7 +42,7 @@ def gpu_integral_equation_solver(G,a,c,N,K=150):
    odd_orders = jnp.arange(1,N,2)
    
    # Broadcasting the input of Hn (scaled Legendre roots multiplied) over the interval [-1,1]
-   special_fn_input = jnp.einsum("ij,k->ijk",legendre_multiples,legendre_roots)
+   special_fn_input = einsum("ij,k->ijk",legendre_multiples,legendre_roots)
 
    p_even = p[even_orders]
    p_odd = p[odd_orders]
@@ -73,18 +56,35 @@ def gpu_integral_equation_solver(G,a,c,N,K=150):
    hn = hn.at[odd_orders].set(hn_odd)
 
    vv = einsum("bij,bjl->bil", hn, jnp.matrix_transpose(hn))
-   jacobian = jnp.einsum("i,j->ij",r,rho) ** 2
+   jacobian = einsum("i,j->ij",r,rho) ** 2
 
-   batched_psi_matrix = jnp.einsum("k,bij,k,ik->bij",w,vv,g_tensor,jacobian)
+   batched_psi_matrix = einsum("k,bij,k,ik->bij",w,vv,g_tensor,jacobian)
    
    # As of now there's no GPU-supported eigendecomposition
-   # However as we are dealing with relatively small matrices the cpu
+   # However as we are dealing with relatively small matrices the CPU
    # version is quite fast + the JIT help reduce time as we
    # are calling it for each patch with the same number of eigenvalues
    cpu_device = jax.devices('cpu')[0]
    cpu_psi = jax.device_put(batched_psi_matrix,device=cpu_device)
    eigenvalues, eigenfunctions = batched_eigdecomposition(cpu_psi,N)
    return eigenvalues, eigenfunctions
+
+@jax.jit
+def batched_Hn_even(x,w,p): 
+  return 4 * jnp.pi * einsum("ijk,bk,k->bij", jnp.cos(x),p,w)
+   
+@jax.jit
+def batched_Hn_odd(x,w,p):
+  return 4* jnp.pi * einsum("ijk,bk,k->bij", jnp.sin(x),p,w)
+
+@partial(jax.jit,static_argnames=['N'])
+def batched_eigdecomposition(X,N):
+    eigenvalues, eigenfunctions = [],[]
+    for i in range(N):
+        lambdas, eig_fns = jnp.linalg.eig(X[i,...])
+        eigenvalues.append(lambdas)
+        eigenfunctions.append(eig_fns)
+    return eigenvalues,eigenfunctions
 
 def cpu_integral_equation_solver(G,N,K=150):
   # TODO: 

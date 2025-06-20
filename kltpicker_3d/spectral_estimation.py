@@ -1,4 +1,3 @@
-import numpy as np 
 from functools import partial
 
 from skimage.filters import window 
@@ -40,7 +39,7 @@ def estimate_isotropic_powerspectrum_tensor(tomograms,max_d):
     E = 0
     for k in range(K):
         sample = tomograms[k]
-        E += np.sum((sample - jnp.mean(sample)) ** 2)
+        E += jnp.sum((sample - jnp.mean(sample)) ** 2)
 
     mean_energy = E/ (K * N ** 3)
 
@@ -74,26 +73,33 @@ def estimate_isotropic_autocorrelation(tomograms, max_d):
     c = c_padded[:max_d+1,:max_d+1,:max_d+1]
     c = jnp.round(c.real).astype(jnp.float32)
 
-    corrs = jnp.zeros_like(dists)
-    corrcount = jnp.zeros_like(dists)
-    for k in range(K):
+    
+    corrs_init = jnp.zeros_like(dists,dtype=jnp.float32)
+    corrcount_init = jnp.zeros_like(dists,dtype=jnp.float32)
+
+    def volume_processing(k, carry):
+        corrs, corrcount = carry
         sample = tomograms[k]
 
-        tomogram_fft = jnp.zeros((2*N+1,2*N+1,2*N+1),dtype=jnp.complex64)
-        tomogram_fft = tomogram_fft.at[:N,:N,:N].set(sample)
+        tomogram_fft = jnp.zeros((2*N+1, 2*N+1, 2*N+1), dtype=jnp.complex64)
+        tomogram_fft = tomogram_fft.at[:N, :N, :N].set(sample)
+
         tomogram_acf = calculate_autocorrelation(tomogram_fft).real
-        tomogram_acf = tomogram_acf[:max_d+1, :max_d+1,:max_d+1]
+        tomogram_acf = tomogram_acf[:max_d+1, :max_d+1, :max_d+1]
 
-        init = jnp.zeros((2,dists.shape[0]))
-        r,cnt = accumulate_acf_radially(tomogram_acf, dist_map, valid_dists,c,init)
-        corrs += r 
-        corrcount += cnt 
+        init = jnp.zeros((2, dists.shape[0]))
+        r, cnt = accumulate_acf_radially(tomogram_acf, dist_map, valid_dists, c, init)
+        return (corrs + r, corrcount + cnt)
 
+    corrs, corrcount =  jax.lax.fori_loop(
+    0,K, volume_processing,(corrs_init, corrcount_init)
+    )
     idx1 = jnp.where(corrcount != 0)[0]
     result = corrs.at[idx1].set(corrs[idx1] / corrcount[idx1])
 
     r3 = create_autocorrelation_tensor(result, dists, N, max_d)
     return r3
+
 
 @partial(jax.jit, static_argnames=['N','max_d'])
 def create_autocorrelation_tensor(r, dists, N, max_d):
@@ -109,7 +115,7 @@ def create_autocorrelation_tensor(r, dists, N, max_d):
 
 @jax.jit
 def cfftn(x):
-    return jnp.fft.fftshift(jnp.fft.fftn(jnp.fft.ifftshift(x)))
+    return fftshift(fftn(ifftshift(x)))
 
 @jax.jit
 def calculate_autocorrelation(patch):
@@ -134,3 +140,10 @@ def accumulate_acf_radially(acf,dist_map,valid_dists,dists_counts,init):
     v, _ = jax.lax.scan(scan_fn,init,vv)
     return v[0,...],v[1,...]
 
+
+# max_d = 10
+# key = jax.random.key(0)
+# X = jax.random.normal(key,shape=(10,10,10))
+# ids = jnp.array([[[i**2 + j ** 2 + k**2 for i in range(10)] for j in range(10)] for k in range(10)])
+# ids = jnp.where(ids<max_d**2)
+# print(estimate_isotropic_powerspectrum_tensor(X,ids,max_d))

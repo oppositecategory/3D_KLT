@@ -10,11 +10,10 @@ import scipy.integrate as integrate
 
 from functools import partial
 
-
 def gpu_integral_equation_solver(G,a,c,N,K=150):
    """ Solves the Kosambi–Karhunen–Loève integral equation up to order N in parallel.
 
-      Args:
+       Args:
         G: radial power spectrum
         a: particle's diameter 
         c: particle energy function's bandwidth 
@@ -62,8 +61,8 @@ def gpu_integral_equation_solver(G,a,c,N,K=150):
    
    # As of now there's no GPU-supported eigendecomposition
    # However as we are dealing with relatively small matrices the CPU
-   # version is quite fast + the JIT help reduce time as we
-   # are calling it for each patch with the same number of eigenvalues
+   # version is quite fast + the compilation help reduces time 
+   # signifincatly for calls after the first one
    cpu_device = jax.devices('cpu')[0]
    cpu_psi = jax.device_put(batched_psi_matrix,device=cpu_device)
    eigenvalues, eigenfunctions = batched_eigdecomposition(cpu_psi,N)
@@ -113,6 +112,7 @@ def cpu_integral_equation_solver(G,N,K=150):
   eigenvalues, eigenvectors = scipy.linalg.eig(U)
   return eigenvalues,eigenvectors
 
-G = lambda x: np.exp(-x**2)
-gpu_integral_equation_solver(G,1,1,100)
-
+#G = lambda x: np.exp(-x**2)
+#print(gpu_integral_equation_solver(G,1,1,100))
+# for N in tqdm(range(1,100)):
+#     x = solve_eigenfunction_equation(G,N)

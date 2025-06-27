@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp 
 from jax.numpy.fft import fftn,ifftn,fftshift,ifftshift
 
-from kltpicker_3d.utils import jitted_binarysearch
 
 def estimate_isotropic_powerspectrum_tensor(tomogram,max_d):
     """ 
@@ -25,14 +24,11 @@ def estimate_isotropic_powerspectrum_tensor(tomogram,max_d):
         max_d = N - 1 
 
     r3 = estimate_isotropic_autocorrelation(tomogram,max_d)
-
     w = jnp.array(window(('gaussian', max_d), (2*N-1,2*N-1,2*N-1)))
-
     p3 = cfftn(r3*w).real
     p3 = jnp.where(p3 < 0, 0, p3)
-
     mean_energy = jnp.sum(jnp.square(tomogram - jnp.mean(tomogram))) / N**3
-
+    
     # Normalize the 3D power spectrum to preserve mean energy
     p3 = (p3/p3.sum())*mean_energy * p3.size
     p3 = jnp.where(p3 < 0, 0, p3) 
@@ -49,7 +45,7 @@ def estimate_isotropic_autocorrelation(tomogram, max_d):
    
     # A distance map such that i,j,k holds the index in dists
     # of distance i**2 + j**2 + k**2
-    idx = jitted_binarysearch(dists,d)
+    idx = jnp.searchsorted(dists,d,side='left')
     dist_map = jnp.zeros(d.shape, dtype=jnp.int32)
     dist_map = dist_map.at[valid_dists].set(idx[valid_dists])
 
@@ -66,35 +62,42 @@ def estimate_isotropic_autocorrelation(tomogram, max_d):
     tomogram_acf = calculate_autocorrelation(tomogram_fft).real
     init = jnp.zeros((2,dists.shape[0]))
     r,cnt = accumulate_acf_radially(tomogram_acf, dist_map, valid_dists,c,init)
-    nonzero_mask = cnt != 0
+    nonzero_mask = (cnt != 0)
     result = jnp.where(nonzero_mask, r / cnt, 0.0)
     r3 = create_autocorrelation_tensor(result, dists, N, max_d)
     return r3
 
-#@partial(jax.jit, static_argnames=['N','max_d'])
+
 def create_autocorrelation_tensor(r, dists, N, max_d):
-    r3 = jnp.zeros((2*N-1,2*N-1,2*N-1))
-    for i in range(-max_d, max_d):
-        for j in range(-max_d, max_d):
-            for k in range(-max_d, max_d):
-                d = i**2 + j**2 + k**2 
-                if d <= max_d ** 2:
-                    id = jnp.searchsorted(dists,d,side='left')
-                    r3 = r3.at[(N-1) + i, (N-1) +j, (N-1)+k].set(r[id])
+    grid = jnp.arange(-max_d, max_d)
+    i, j, k = jnp.meshgrid(grid, grid, grid, indexing="ij")
+    
+    d = i**2 + j**2 + k**2
+    mask = d <= max_d**2
+    idx = jnp.searchsorted(dists, d, side="left")
+    r3 = jnp.zeros((2*N-1, 2*N-1, 2*N-1))
+
+    idx1= idx[mask]
+    i1, j1, k1 = i[mask], j[mask],k[mask]
+    values = r[idx1]
+
+    x,y,z = (N - 1) + i1, (N-1) + j1, (N-1) + k1
+    r3 = r3.at[x, y, z].set(values)
     return r3
 
-#@jax.jit
+
+@jax.jit
 def cfftn(x):
     return fftshift(fftn(ifftshift(x)))
 
-#@jax.jit
+@jax.jit
 def calculate_autocorrelation(patch):
     # Estimating the autocorrelation by Wiener-Khinchin theorem
     patch_fft = fftn(patch)
     acf = ifftn(patch_fft * jnp.conj(patch_fft))
     return acf 
 
-#@jax.jit
+@jax.jit
 def accumulate_acf_radially(acf,dist_map,valid_dists,dists_counts,init):
     """ The function transforms the autocorrelation function into it's
         isotoropic form by averaging over all possible distances of given distance.

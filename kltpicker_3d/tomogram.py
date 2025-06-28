@@ -19,13 +19,12 @@ def factorize_RPSD(tomograms):
 
     _, bins = generate_uniform_radial_sampling_points(N)
 
-    tomograms = tomograms- np.mean(tomograms, axis=(1,2,3)).reshape(-1,1,1,1)
+    tomograms = tomograms - jnp.mean(tomograms, axis=(1,2,3)).reshape(-1,1,1,1)
     psds = vect_spectrum_estimation(tomograms,max_d)
 
     rblocks = np.zeros((K,N))
     for k in range(N):
         rblocks[k] = radial_average(psds[k],bins,N)
-    rblocks = jnp.array(rblocks)
     
     factorization = alternating_least_squares_solver(rblocks,200,1e-2)
     return factorization

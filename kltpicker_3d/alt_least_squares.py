@@ -31,11 +31,11 @@ def alternating_least_squares_solver(samples, max_iter, eps):
 
     norms_1 = jnp.sum(jnp.abs(S),axis=0)
     v = jnp.abs(S[:,jnp.argmin(norms_1)])
-
-    dists = jnp.sum(jnp.abs(S[:,None, :] - S[None,:,:]),
-                axis=2)
-    indices = jnp.unravel_index(jnp.argmax(dists), dists.shape)
-    gamma = jnp.abs(S[:,indices[1]] - S[:,indices[0]])
+    
+    # Faster approximation instead of computing the argmax of l2 error
+    norms_infty = jnp.max(jnp.abs(S),axis=1)
+    max_infty, min_infty = jnp.argmax(norms_infty), jnp.argmin(norms_infty)
+    gamma  = jnp.abs(S[:,max_infty] - S[:,min_infty])
 
     alpha = jnp.dot(gamma, S - v[...,None]) / jnp.sum(gamma**2)
     alpha = jnp.clip(alpha, 0, 1)

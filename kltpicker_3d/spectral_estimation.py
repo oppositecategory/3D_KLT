@@ -45,6 +45,7 @@ def estimate_isotropic_autocorrelation(tomogram, max_d):
    
     # A distance map such that i,j,k holds the index in dists
     # of distance i**2 + j**2 + k**2
+    #idx = jitted_binarysearch(dists,d)
     idx = jnp.searchsorted(dists,d,side='left')
     dist_map = jnp.zeros(d.shape, dtype=jnp.int32)
     dist_map = dist_map.at[valid_dists].set(idx[valid_dists])
@@ -57,6 +58,7 @@ def estimate_isotropic_autocorrelation(tomogram, max_d):
     c_padded = calculate_autocorrelation(tmp)
     c = c_padded[:max_d+1,:max_d+1,:max_d+1]
     c = jnp.round(c.real).astype(jnp.float32)
+    
     tomogram_fft = jnp.zeros((2*N+1,2*N+1,2*N+1),dtype=jnp.complex64)
     tomogram_fft = tomogram_fft.at[:N,:N,:N].set(tomogram)
     tomogram_acf = calculate_autocorrelation(tomogram_fft).real
@@ -70,7 +72,7 @@ def estimate_isotropic_autocorrelation(tomogram, max_d):
 
 def create_autocorrelation_tensor(r, dists, N, max_d):
     grid = jnp.arange(-max_d, max_d)
-    i, j, k = jnp.meshgrid(grid, grid, grid, indexing="ij")
+    i, j, k = jnp.meshgrid(grid, grid, grid)
     
     d = i**2 + j**2 + k**2
     mask = d <= max_d**2
@@ -85,19 +87,15 @@ def create_autocorrelation_tensor(r, dists, N, max_d):
     r3 = r3.at[x, y, z].set(values)
     return r3
 
-
-@jax.jit
 def cfftn(x):
     return fftshift(fftn(ifftshift(x)))
 
-@jax.jit
 def calculate_autocorrelation(patch):
     # Estimating the autocorrelation by Wiener-Khinchin theorem
     patch_fft = fftn(patch)
     acf = ifftn(patch_fft * jnp.conj(patch_fft))
     return acf 
 
-@jax.jit
 def accumulate_acf_radially(acf,dist_map,valid_dists,dists_counts,init):
     """ The function transforms the autocorrelation function into it's
         isotoropic form by averaging over all possible distances of given distance.

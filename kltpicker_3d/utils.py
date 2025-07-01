@@ -15,8 +15,9 @@ def prewhiten_patch(patch, noise_psd):
         returns:
             p3: sub-tomogram after cleaning the approximated noise from it's spectrum
     """
-    L = patch.shape[0]
-    midpoint = int(np.ceil(L - 0.5))
+    L,_,_ = patch.shape
+    M,_,_ = noise_psd.shape
+    midpoint = M//2
 
     start = midpoint - L//2
     end = midpoint + L//2 
@@ -29,8 +30,7 @@ def prewhiten_patch(patch, noise_psd):
     filter = (filter + jnp.flip(filter,axis=1))/2
     filter = (filter + jnp.flip(filter,axis=2))/2
 
-    delta = jnp.finfo(patch.dtype).eps
-    mask = filter > 100 * delta
+    mask = filter > 1e-14
     filter = jnp.where(mask, 1 / filter,0)
 
     padded = jnp.zeros_like(noise_psd)

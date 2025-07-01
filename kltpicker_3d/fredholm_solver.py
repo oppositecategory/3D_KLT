@@ -11,7 +11,7 @@ import scipy.integrate as integrate
 from functools import partial
 
 def gpu_integral_equation_solver(G,a,c,N,K=150):
-   """ Solves the Kosambi–Karhunen–Loève integral equation up to order N in parallel.
+   """ Solves the Kosambi–Karhunen–Loève Fredholm integral equation up to order N in parallel.
 
        Args:
         G: radial power spectrum

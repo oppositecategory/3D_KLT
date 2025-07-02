@@ -1,11 +1,8 @@
 import numpy as np
 
 
-def generate_rpsd_data(K,N, std):
-    K = 200
-    N = 32
+def generate_gaussian_rpsd_data(K,N, std):
     M = 2*N - 1 
-    max_d = int(np.floor(N/3))
 
     sigma = 1 
     w = 2*5*sigma 
@@ -19,7 +16,6 @@ def generate_rpsd_data(K,N, std):
     C = M ** 3 / H.sum()
     normalized_H = np.fft.ifftshift(np.sqrt(H * C))
 
-    window = np.bartlett(M)
     samples = np.zeros((K,N,N,N))
     alphas = np.random.beta(2,5,size=(K)) 
     # Asymetric distriution with 0-skewness

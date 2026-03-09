@@ -47,13 +47,13 @@ def solve_radial_fredholm_equation(Gx,
     eigfuncs[:,eigvals ==0] = 0
     return eigvals, eigfuncs, W
 
-
 def create_GPSF_templates(eigfuncs, 
                           eigvals, 
                           orders,
                           G,
                           a: float,c: float, 
-                          N: int, K=150):
+                          template_size: int, 
+                          K=150):
     """
         Generates 3D templates in Generalized Prolate Spherodial Function basis
         using radial solutions of KLT equations and their spectrum.
@@ -79,25 +79,24 @@ def create_GPSF_templates(eigfuncs,
             - Clarify scale of a and how to determine patch_size. 
             - In original code patch_size_func/2 - 1 was used. Why?
     """
-    grid = np.arange(-(N-1),N)
+    radmax = np.floor((template_size-1)/2)
+    grid = np.arange(-radmax,radmax+1,1)
     X,Y,Z = np.meshgrid(grid,grid,grid)
     r_tensor = np.sqrt(X**2 + Y**2 + Z**2)
     rho_uniform, idx = np.unique(r_tensor.flatten(),return_inverse=True)
 
     # Legendre roots for both integrals
     rho_leg, w = scipy.special.roots_legendre(K)
-    rho_leg_a =  (a * 0.5) * rho_leg + a / 2.0  
-    rho_leg_c =  (c * 0.5)* rho_leg + c / 2
+    rho_leg_a =  (a * 0.5) * rho_leg + a * 0.5 
+    rho_leg_c =  (c * 0.5)* rho_leg + c * 0.5
     
     # Truncates the spectra at 99%
     eigval_cumsum = np.cumsum(eigvals / np.sum(eigvals))
-    truncate_idx = (eigval_cumsum < 0.99).argmax() + 1
+    truncate_idx = (eigval_cumsum > 0.99).argmax() + 1
 
     eigfuncs = eigfuncs[:truncate_idx,...]
     eigvals = eigvals[:truncate_idx,...]
     orders = orders[:truncate_idx,...]
-
-    max_N = orders.max() + 1
 
     # We interpolate the radial solutions into uniform radial basis
     # using the Fredholm equation (re-expressing new values of R_{N,m} using  
@@ -136,10 +135,11 @@ def create_GPSF_templates(eigfuncs,
     theta = np.arctan2(Y, X)
     phi = np.arctan2(Z,np.sqrt(X**2 + Y**2))
 
+    max_N = orders.max() + 1
     sph_harm = np.zeros((max_N,max_N) + theta.shape, dtype=np.complex64)
-    for N in range(max_N):
-        for m in range(N):
-            sph_harm[N,m] = sph_harm(m,N,theta,phi)
+    for n in range(max_N+1):
+        for m in range(n+1):
+            sph_harm[n,m] = sph_harm(m,n,theta,phi)
     
     templates = sph_harm[orders]*radial_templates[:,None,...]
     return templates, eigvals, orders

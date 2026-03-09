@@ -33,7 +33,7 @@ def alternating_least_squares_solver(samples, max_iter, eps):
     v = jnp.abs(S[:,jnp.argmin(norms_1)])
     
     # Faster approximation instead of computing the argmax of l2 error
-    norms_infty = jnp.max(jnp.abs(S),axis=1)
+    norms_infty = jnp.max(jnp.abs(S),axis=0)
     max_infty, min_infty = jnp.argmax(norms_infty), jnp.argmin(norms_infty)
     gamma  = jnp.abs(S[:,max_infty] - S[:,min_infty])
 

@@ -6,7 +6,7 @@ import jax.numpy as jnp
 
 from kltpicker_3d.alt_least_squares import alternating_least_squares_solver
 from kltpicker_3d.spectral_estimation import estimate_isotropic_powerspectrum_tensor
-from kltpicker_3d.fredholm_solver import solve_radial_fredholm_equation,create_GPSF_templates
+from kltpicker_3d.fredholm_solver import solve_radial_fredholm_equation
 from kltpicker_3d.utils import * 
 
 # Compiled functions 
@@ -53,10 +53,12 @@ class KLTParticleDetector3D:
 
         self.eigvals = None 
         self.eiguncs = None 
+        self.score_mat = None
     
     def process_tomogram(self):
         factorization, noise_var_approx = self.factorize_RPSD()
         particle_psd, noise_psd = factorization.gamma, factorization.v
+        particle_psd /= np.linalg.norm(particle_psd)
         #whitened_tomograms = prewhiten_tomogram(tomogram, noise_psd)
         
         c = self.bandlimit 
@@ -221,6 +223,7 @@ class KLTParticleDetector3D:
         templates = sph_harm[orders]*radial_templates[:,None,...]
         return templates, eigvals
     
+
     def detect_particles(self,
                          templates, 
                          noise_var_approx):
@@ -228,7 +231,6 @@ class KLTParticleDetector3D:
             Function apply FFT-based convolution to run each generated template-kernel across
             the whole 3D tomogram. 
         """
-        M = int(self.patch_size)
         n_radial, n_harm, nx, ny, nz = templates.shape
         psi = templates.reshape(n_radial * n_harm, nx * ny * nz)
         eigvals_r = jnp.repeat(self.eigvals, n_harm)
@@ -252,11 +254,12 @@ class KLTParticleDetector3D:
         score_mat = jnp.zeros((x_num, y_num, z_num), dtype=jnp.float64)
 
         for i in range(kernels.shape[0]):
-            kernel = jnp.conj(np.flip(kernels[i], axis=(0,1,2)))
+            kernel = jnp.conj(jnp.flip(kernels[i], axis=(0,1,2)))
             response = jax.scipy.signal.fftconvolve(self.tomogram, kernel,mode='valid')
             score_mat += D[i] * jnp.abs(response)**2
 
         score_mat = np.array(score_mat - mu)
+        self.score_mat = score_mat 
         num_particles, coords = self.picking_from_scoring_vol_3d(score_mat)
         return num_particles, coords
     
@@ -287,8 +290,9 @@ class KLTParticleDetector3D:
         while num_picked < min(max_iter, num_limit):
             flat_idx = np.argmax(scoring)
             p_max = scoring.flat[flat_idx]
+            p_norm = p_max / (log_max + 1e-12)
 
-            if not (p_max > threshold):
+            if not (p_norm > threshold):
                 break
 
             ix, iy, iz = np.unravel_index(flat_idx, scoring.shape)

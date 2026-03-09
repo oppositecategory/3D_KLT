@@ -30,12 +30,12 @@ class KLTParticleDetector3D:
         self.max_order = max_order
         self.bandlimit = bandlimit
 
-        #patch_size = np.floor(0.8 * self.mgscale * self.particle_diameter)
-        patch_size = self.particle_diameter
+        patch_size = np.floor(0.8 * self.mgscale * self.particle_diameter)
+        #patch_size = self.particle_diameter
         if np.mod(patch_size,2)  == 0:
             patch_size -= 1
         self.patch_size = patch_size 
-        #template_diameter = np.floor(0.4 * self.mgscale * particle_diameter)
+        template_diameter = np.floor(0.4 * self.mgscale * particle_diameter)
         template_diameter = self.particle_diameter
         if np.mod(template_diameter,2) == 0:
             template_diameter -= 1 
@@ -87,17 +87,16 @@ class KLTParticleDetector3D:
         eigvals = eigvals[idx]
 
         idx = np.where(eigvals > np.spacing(1))[0]
-        self.eigvals = eigvals[idx]
-        self.eigfuncs = eigfuncs[idx,:]
+        eigvals = eigvals[idx]
+        eigfuncs = eigfuncs[idx,:]
         orders = orders[idx]
 
-        templates, eigvals = self.create_GPSF_templates(eigfuncs,
-                                                        eigvals,
+        templates, eigvals = self.create_GPSF_templates(eigvals,
+                                                        eigfuncs,
                                                         orders, 
                                                         Gx)
 
         num_detected,coords = self.detect_particles(templates, 
-                                                    eigvals, 
                                                     noise_var_approx)
         return num_detected,coords
 
@@ -130,8 +129,8 @@ class KLTParticleDetector3D:
         return factorization,noise_var_approx
 
     def create_GPSF_templates(self,
-                              eigfuncs, 
-                              eigvals, 
+                              eigvals,
+                              eigfuncs,
                               orders,
                               G):
         """
@@ -139,14 +138,8 @@ class KLTParticleDetector3D:
             using radial solutions of KLT equations and their spectrum.
 
             args:
-                eigfuncs: radial solutions of KLT equations
-                eigvals: correspoonding eigenvalues
                 orders: the N orders of the corresponding solutions
                 G: particle function's radial PSD 
-                a: particle diameter
-                c: particle's function bandlimit
-                N: size of patch
-                K: Legendre quadrature order
             
             returns:
                 templates: 3D templates composed of radial and angular basis functions. 
@@ -177,6 +170,9 @@ class KLTParticleDetector3D:
         eigfuncs = eigfuncs[:truncate_idx,...]
         eigvals = eigvals[:truncate_idx,...]
         orders = orders[:truncate_idx,...]
+
+        self.eigfuncs = eigfuncs 
+        self.eigvals = eigvals 
 
         # We interpolate the radial solutions into uniform radial basis
         # using the Fredholm equation (re-expressing new values of R_{N,m} using  
@@ -227,7 +223,6 @@ class KLTParticleDetector3D:
     
     def detect_particles(self,
                          templates, 
-                         eigvals,
                          noise_var_approx):
         """ GPU-Accelerated particle detection.
             Function apply FFT-based convolution to run each generated template-kernel across
@@ -236,7 +231,7 @@ class KLTParticleDetector3D:
         M = int(self.patch_size)
         n_radial, n_harm, nx, ny, nz = templates.shape
         psi = templates.reshape(n_radial * n_harm, nx * ny * nz)
-        eigvals_r = jnp.repeat(eigvals, n_harm)
+        eigvals_r = jnp.repeat(self.eigvals, n_harm)
 
         Q,R = jnp.linalg.qr(psi.T)
         H = R @ np.diag(eigvals_r) @ R.T + noise_var_approx * np.eye(R.shape[0])
@@ -251,9 +246,9 @@ class KLTParticleDetector3D:
         B = Q @ P
         kernels = B.T.reshape(n_radial * n_harm, nx,ny,nz)
 
-        x_num = self.tomogram.shape[0] - M + 1
-        y_num = self.tomogram.shape[1] - M + 1
-        z_num = self.tomogram.shape[2] - M + 1
+        x_num = self.tomogram.shape[0] - nx + 1
+        y_num = self.tomogram.shape[1] - ny + 1
+        z_num = self.tomogram.shape[2] - nz + 1
         score_mat = jnp.zeros((x_num, y_num, z_num), dtype=jnp.float64)
 
         for i in range(kernels.shape[0]):

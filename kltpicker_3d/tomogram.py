@@ -12,6 +12,8 @@ from kltpicker_3d.utils import *
 # Compiled functions 
 vect_spectrum_estimation = jax.vmap(estimate_isotropic_powerspectrum_tensor,
                                     in_axes=(0,None))
+vect_radial_average = jax.vmap(radial_average_jax,
+                               in_axes=(0,None,None,None))
 
 class KLTParticleDetector3D:
     def __init__(self, 
@@ -43,9 +45,10 @@ class KLTParticleDetector3D:
         self.max_iter = max_iter 
         
         S = int(2*patch_size-1)
-        uniform_points, bins = generate_uniform_radial_sampling_points(S, bandlimit)
+        uniform_points, shell_ids, counts = generate_uniform_radial_sampling_points(S, bandlimit)
         self.uniform_points = uniform_points
-        self.bins = bins
+        self.shell_ids = shell_ids
+        self.counts = counts
 
         self.legendre_order = legendre_order
         self.num_particles = num_particles
@@ -104,7 +107,6 @@ class KLTParticleDetector3D:
 
     def factorize_RPSD(self):
         M = int(self.patch_size)
-        bins = self.bins
         max_d = int(np.floor(0.3*M))
 
         micro_size = np.min(self.tomogram.shape)
@@ -125,8 +127,8 @@ class KLTParticleDetector3D:
         )
 
         psds = vect_spectrum_estimation(patches,max_d)
-
-        rblocks = np.array([radial_average(psds[k], bins, len(bins)) for k in range(patches.shape[0])])
+        #rblocks = np.array([radial_average(psds[k], bins, len(bins)) for k in range(patches.shape[0])])
+        rblocks = vect_radial_average(psds, self.shell_ids, self.counts,self.uniform_points.shape[0])
         factorization = alternating_least_squares_solver(rblocks,self.max_iter,1e-4)
         return factorization,noise_var_approx
 
@@ -236,28 +238,27 @@ class KLTParticleDetector3D:
         eigvals_r = jnp.repeat(self.eigvals, n_harm)
 
         Q,R = jnp.linalg.qr(psi.T)
-        H = R @ np.diag(eigvals_r) @ R.T + noise_var_approx * np.eye(R.shape[0])
-        H_inv = jnp.linalg.inv(H)
-        T = (1 / noise_var_approx) * np.eye(R.shape[0]) - H_inv 
+        H = (R * eigvals_r[None,:]) @ R.T + noise_var_approx * jnp.eye(R.shape[0])
+        H_eigvals,P = jnp.linalg.eigh(H)
+        D = (1.0/noise_var_approx) - (1.0/H_eigvals)
 
         mu = jnp.linalg.slogdet((1/ noise_var_approx) * H)[1]
-
-        D,P = jnp.linalg.eigh(T)
         D, P = D[::-1],P[:,::-1]
-
+        #D,P = jnp.linalg.eigh(T)
         B = Q @ P
         kernels = B.T.reshape(n_radial * n_harm, nx,ny,nz)
 
         x_num = self.tomogram.shape[0] - nx + 1
         y_num = self.tomogram.shape[1] - ny + 1
         z_num = self.tomogram.shape[2] - nz + 1
-        score_mat = jnp.zeros((x_num, y_num, z_num), dtype=jnp.float64)
+        init = jnp.zeros((x_num, y_num, z_num), dtype=jnp.result_type(self.tomogram, jnp.float32))
 
-        for i in range(kernels.shape[0]):
-            kernel = jnp.conj(jnp.flip(kernels[i], axis=(0,1,2)))
-            response = jax.scipy.signal.fftconvolve(self.tomogram, kernel,mode='valid')
-            score_mat += D[i] * jnp.abs(response)**2
+        def body(i, acc):
+            k = jnp.conj(jnp.flip(kernels[i], axis=(0,1,2)))
+            r = jax.scipy.signal.fftconvolve(self.tomogram, k, mode="valid")
+            return acc + D[i] * (jnp.abs(r) ** 2)
 
+        score_mat = jax.lax.fori_loop(0, kernels.shape[0], body, init)
         score_mat = np.array(score_mat - mu)
         self.score_mat = score_mat 
         num_particles, coords = self.picking_from_scoring_vol_3d(score_mat)

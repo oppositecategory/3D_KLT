@@ -51,7 +51,7 @@ def prewhiten_patch(patch, noise_psd):
     return p2 
 
 def generate_uniform_radial_sampling_points(L, r_max, nbins=None):
-    k = np.fft.fftshift(np.fft.fftfreq(L, d=1.0 / (2 * r_max)))
+    k = np.fft.fftshift(2 * np.fft.fftfreq(L, d=1.0))
     kx, ky, kz = np.meshgrid(k, k, k, indexing="ij")
     r = np.sqrt(kx**2 + ky**2 + kz**2)
     eps = np.finfo(float).eps

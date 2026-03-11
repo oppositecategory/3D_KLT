@@ -20,7 +20,6 @@ class KLTParticleDetector3D:
                  tomogram,
                  particle_diameter: float,
                  mgscale: float,
-                 bandlimit: float,
                  num_particles: int, 
                  legendre_order:int = 150,
                  threshold: float = 0,
@@ -30,7 +29,7 @@ class KLTParticleDetector3D:
         self.particle_diameter = particle_diameter 
         self.mgscale = mgscale
         self.max_order = max_order
-        self.bandlimit = bandlimit
+        self.bandlimit = np.pi
 
         patch_size = np.floor(0.8 * self.mgscale * self.particle_diameter)
         #patch_size = self.particle_diameter
@@ -38,14 +37,13 @@ class KLTParticleDetector3D:
             patch_size -= 1
         self.patch_size = patch_size 
         template_diameter = np.floor(0.4 * self.mgscale * particle_diameter)
-        template_diameter = self.particle_diameter
         if np.mod(template_diameter,2) == 0:
             template_diameter -= 1 
         self.template_diameter = int(template_diameter)
         self.max_iter = max_iter 
         
         S = int(2*patch_size-1)
-        uniform_points, shell_ids, counts = generate_uniform_radial_sampling_points(S, bandlimit)
+        uniform_points, shell_ids, counts = generate_uniform_radial_sampling_points(S, self.bandlimit)
         self.uniform_points = uniform_points
         self.shell_ids = shell_ids
         self.counts = counts
@@ -115,7 +113,7 @@ class KLTParticleDetector3D:
         t = self.tomogram[:m*M, :m*M, :m*M]
         # (m*M, m*M, m*M) -> (m, M, m, M, m, M) -> (m, m, m, M, M, M)
         patches = t.reshape(m, M, m, M, m, M).transpose(0, 2, 4, 1, 3, 5)
-        # Flatten patch index to match your original (m**3, M, M, M)
+        # Flatten patch index to match (m**3, M, M, M)
         patches = patches.reshape(m**3, M, M, M)
 
         patches = patches - jnp.mean(patches, axis=(1,2,3)).reshape(-1,1,1,1)
@@ -160,6 +158,7 @@ class KLTParticleDetector3D:
         grid = np.arange(-radmax,radmax+1,1)
         X,Y,Z = np.meshgrid(grid,grid,grid)
         r_tensor = np.sqrt(X**2 + Y**2 + Z**2)
+        #r_tensor = np.where(r_tensor > self.bandlimit, 0, r_tensor)
         rho_uniform, idx = np.unique(r_tensor,return_inverse=True)
 
         # Legendre roots for both integrals
@@ -244,7 +243,6 @@ class KLTParticleDetector3D:
 
         mu = jnp.linalg.slogdet((1/ noise_var_approx) * H)[1]
         D, P = D[::-1],P[:,::-1]
-        #D,P = jnp.linalg.eigh(T)
         B = Q @ P
         kernels = B.T.reshape(n_radial * n_harm, nx,ny,nz)
 

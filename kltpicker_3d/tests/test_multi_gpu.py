@@ -17,6 +17,7 @@ from kltpicker_3d.multi_gpu import (
     plan_cufft_fft_shape,
     plan_template_fft_batch,
     ranked_candidate_nms_3d,
+    validate_active_score_templates,
 )
 from kltpicker_3d.streaming import ArrayVolumeSource
 from kltpicker_3d.utils import construct_finite_bandpass_filter
@@ -308,6 +309,29 @@ def test_fft_batch_planner_accounts_for_resident_template_shard():
 
     assert plan["batch_size"] >= 1
     assert plan["estimated_peak_bytes"] <= plan["budget_bytes"]
+
+
+def test_active_score_template_validation_ignores_dropped_nan_rows():
+    templates = np.ones((3, 3, 3, 3), dtype=np.complex64)
+    templates[1] = np.nan
+
+    validate_active_score_templates(
+        templates,
+        np.array([0, 2], dtype=np.int64),
+        rows_per_chunk=1,
+    )
+
+
+def test_active_score_template_validation_rejects_retained_nan_rows():
+    templates = np.ones((3, 3, 3, 3), dtype=np.complex64)
+    templates[1] = np.nan
+
+    with np.testing.assert_raises_regex(RuntimeError, "non-finite rows: \\[1\\]"):
+        validate_active_score_templates(
+            templates,
+            np.array([0, 1, 2], dtype=np.int64),
+            rows_per_chunk=1,
+        )
 
 
 def test_global_candidate_nms_is_independent_of_device_completion_order():

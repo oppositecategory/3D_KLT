@@ -1151,7 +1151,7 @@ def main() -> None:
                 log_array("KLT templates", detector.templates)
                 template_spatial_shape = detector.templates.shape[1:]
             else:
-                template_spatial_shape = (detector.template_side,) * 3
+                template_spatial_shape = (detector.model.template_side,) * 3
                 LOGGER.info("KLT raw templates: omitted after completed block QR")
             log_array("Template eigenvalues", detector.model.eigvals)
             LOGGER.info(
@@ -1269,11 +1269,42 @@ def main() -> None:
                 LOGGER.info("Released raw pre-QR template bank from host RAM")
             log_array("KLT score weights", detector.score_weights)
             LOGGER.info("Block-QR score templates: %s", score_templates_path)
+            active_score_mask = (
+                np.isfinite(detector.template_normalization)
+                & np.isfinite(detector.score_weights)
+                & np.isfinite(detector.adjusted_template_eigenvalues)
+                & (detector.score_weights > 0)
+            )
+            active_nominal_energy = np.sum(
+                detector.model.eigvals[detector.score_template_indices][
+                    active_score_mask
+                ]
+                * detector.score_multiplicities[active_score_mask]
+            )
+            retained_nominal_energy = np.sum(
+                detector.model.eigvals[detector.score_template_indices]
+                * detector.score_multiplicities
+            )
+            active_trace_fraction = (
+                None
+                if detector.model.retained_template_energy_fraction is None
+                else detector.model.retained_template_energy_fraction
+                * active_nominal_energy
+                / retained_nominal_energy
+            )
             LOGGER.info(
-                "Conjugate symmetry: executed representatives=%d | "
-                "effective modes=%d",
-                detector.score_templates.shape[0],
-                int(np.sum(detector.score_multiplicities)),
+                "Conjugate symmetry: checkpoint representatives=%d | "
+                "active representatives=%d | dropped=%d | active effective "
+                "modes=%d | active trace=%s",
+                active_score_mask.size,
+                int(np.count_nonzero(active_score_mask)),
+                int(np.count_nonzero(~active_score_mask)),
+                int(np.sum(detector.score_multiplicities[active_score_mask])),
+                (
+                    "unknown"
+                    if active_trace_fraction is None
+                    else f"{active_trace_fraction:.6f}"
+                ),
             )
             LOGGER.info("KLT likelihood offset: %.8g", detector.score_offset)
 

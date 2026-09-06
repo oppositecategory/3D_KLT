@@ -659,7 +659,11 @@ class KLTParticleDetector3D:
         # are generally interleaved. Process them by order and write each mode
         # to its precomputed output slice. This reuses Y_ell^m within an order
         # without retaining an angular grid for every ell in a large cache.
-        for order in np.unique(angular_orders):
+        for order in tqdm(
+            np.unique(angular_orders),
+            desc="3-D KLT template construction",
+            unit="ell",
+        ):
             order = int(order)
             if nonnegative_m_only:
                 m_values = np.arange(0, order + 1, dtype=np.int64)

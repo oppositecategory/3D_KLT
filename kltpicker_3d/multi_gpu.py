@@ -384,17 +384,11 @@ def distributed_block_qr_score_parameters(
             len(selected_devices),
         )
         if host_qr:
-            for block_index, (
-                indices,
-                output_indices,
-                multiplicity,
-            ) in enumerate(blocks, start=1):
-                LOGGER.info(
-                    "Host block QR %d/%d for radial width=%d",
-                    block_index,
-                    len(blocks),
-                    width,
-                )
+            for indices, output_indices, multiplicity in tqdm(
+                blocks,
+                desc=f"Host block QR width={width}",
+                unit="block",
+            ):
                 host_templates = np.asarray(
                     template_array[indices],
                     dtype=np.complex64,
@@ -417,15 +411,15 @@ def distributed_block_qr_score_parameters(
         compiled_qr = jax.jit(
             partial(_qr_score_block, noise_variance=float(noise_variance)),
         )
-        for round_start in range(0, len(blocks), len(selected_devices)):
+        round_starts = range(0, len(blocks), len(selected_devices))
+        for round_start in tqdm(
+            round_starts,
+            total=(len(blocks) + len(selected_devices) - 1)
+            // len(selected_devices),
+            desc=f"GPU block QR width={width}",
+            unit="round",
+        ):
             round_blocks = blocks[round_start : round_start + len(selected_devices)]
-            LOGGER.info(
-                "Block QR round %d/%d: processing %d block(s)",
-                round_start // len(selected_devices) + 1,
-                (len(blocks) + len(selected_devices) - 1)
-                // len(selected_devices),
-                len(round_blocks),
-            )
             pending_results = []
             for slot, (indices, output_indices, multiplicity) in enumerate(
                 round_blocks
@@ -557,6 +551,48 @@ def plan_template_fft_batch(
         "fft_shape_y": planned_fft_shape[1],
         "fft_shape_x": planned_fft_shape[2],
     }
+
+
+def _take_template_rows(
+    templates: npt.NDArray[np.generic],
+    indices: npt.NDArray[np.int64],
+) -> npt.NDArray[np.complex64]:
+    """Read logical template rows without copying contiguous memmap runs."""
+    if indices.size == 0:
+        return np.empty((0, *templates.shape[1:]), dtype=np.complex64)
+    if indices[-1] - indices[0] + 1 == indices.size:
+        rows = templates[int(indices[0]) : int(indices[-1]) + 1]
+    else:
+        rows = templates[indices]
+    return np.asarray(rows, dtype=np.complex64)
+
+
+def validate_active_score_templates(
+    templates: npt.NDArray[np.generic],
+    indices: npt.NDArray[np.int64],
+    *,
+    rows_per_chunk: int = 16,
+) -> None:
+    """Exhaustively reject non-finite rows before a long scoring run."""
+    if rows_per_chunk < 1:
+        raise ValueError("rows_per_chunk must be positive")
+    chunk_starts = range(0, indices.size, rows_per_chunk)
+    for start in tqdm(
+        chunk_starts,
+        total=(indices.size + rows_per_chunk - 1) // rows_per_chunk,
+        desc="Validating active score templates",
+        unit="chunk",
+        disable=indices.size < 1024,
+    ):
+        chunk_indices = indices[start : start + rows_per_chunk]
+        rows = _take_template_rows(templates, chunk_indices)
+        finite_rows = np.all(np.isfinite(rows), axis=(1, 2, 3))
+        if not np.all(finite_rows):
+            invalid = chunk_indices[~finite_rows]
+            raise RuntimeError(
+                "active score-template checkpoint contains non-finite rows: "
+                f"{invalid[:8].tolist()}"
+            )
 
 
 def compute_klt_score_block(
@@ -1355,8 +1391,26 @@ class MultiGPUKLTParticleDetector3D:
         ):
             raise RuntimeError("score-model arrays do not match score templates")
         templates = np.asanyarray(self.score_templates)
-        normalization = self.template_normalization
-        score_weights = self.score_weights
+        active_template_indices = np.flatnonzero(
+            np.isfinite(self.template_normalization)
+            & np.isfinite(self.score_weights)
+            & np.isfinite(self.adjusted_template_eigenvalues)
+            & (self.score_weights > 0)
+        ).astype(np.int64, copy=False)
+        if active_template_indices.size < 1:
+            raise RuntimeError("score model contains no active finite templates")
+        inactive_count = score_count - active_template_indices.size
+        if inactive_count:
+            LOGGER.warning(
+                "Dropping %d inactive score templates with zero or non-finite "
+                "likelihood parameters; active=%d/%d",
+                inactive_count,
+                active_template_indices.size,
+                score_count,
+            )
+        validate_active_score_templates(templates, active_template_indices)
+        normalization = self.template_normalization[active_template_indices]
+        score_weights = self.score_weights[active_template_indices]
         score_offset = self.score_offset
 
         template_radius = templates.shape[1] // 2
@@ -1371,7 +1425,7 @@ class MultiGPUKLTParticleDetector3D:
         fft_shape = plan_cufft_fft_shape(loaded_shape, self.score_fft_shape)
         device_count = len(self.devices)
         templates_per_device = (
-            templates.shape[0] + device_count - 1
+            active_template_indices.size + device_count - 1
         ) // device_count
         if (
             self.score_template_chunk_size is not None
@@ -1379,6 +1433,7 @@ class MultiGPUKLTParticleDetector3D:
         ):
             return self._score_candidates_with_streamed_template_chunks(
                 templates,
+                active_template_indices,
                 normalization,
                 score_weights,
                 score_offset,
@@ -1448,7 +1503,7 @@ class MultiGPUKLTParticleDetector3D:
                 )
             capacity_plan["batch_size"] = batch_size
             capacity_plan["templates_per_device"] = padded_templates_per_device
-            capacity_plan["template_count"] = int(templates.shape[0])
+            capacity_plan["template_count"] = int(active_template_indices.size)
             capacity_plan["batches_per_device"] = (
                 padded_templates_per_device // batch_size
             )
@@ -1458,7 +1513,7 @@ class MultiGPUKLTParticleDetector3D:
             self.score_plan.update(
                 {
                     "templates_per_device": padded_templates_per_device,
-                    "template_count": int(templates.shape[0]),
+                    "template_count": int(active_template_indices.size),
                     "batches_per_device": padded_templates_per_device // batch_size,
                     "subvolume_count": self.processor.subvolume_count,
                 }
@@ -1467,7 +1522,7 @@ class MultiGPUKLTParticleDetector3D:
         LOGGER.info(
             "KLT score model: templates=%d | devices=%d | local padded=%d | "
             "FFT batch=%d | batches/device/subvolume=%d | subvolumes=%d",
-            templates.shape[0],
+            active_template_indices.size,
             device_count,
             padded_templates_per_device,
             batch_size,
@@ -1497,7 +1552,10 @@ class MultiGPUKLTParticleDetector3D:
         weight_shards = []
         for device_index in range(device_count):
             start = device_index * templates_per_device
-            stop = min(start + templates_per_device, templates.shape[0])
+            stop = min(
+                start + templates_per_device,
+                active_template_indices.size,
+            )
             count = max(0, stop - start)
             template_shard = np.zeros(
                 (padded_templates_per_device, *templates.shape[1:]),
@@ -1512,9 +1570,9 @@ class MultiGPUKLTParticleDetector3D:
                 dtype=np.float32,
             )
             if count:
-                template_shard[:count] = np.asarray(
-                    templates[start:stop],
-                    dtype=np.complex64,
+                template_shard[:count] = _take_template_rows(
+                    templates,
+                    active_template_indices[start:stop],
                 )
                 normalization_shard[:count] = normalization[start:stop]
                 weight_shard[:count] = score_weights[start:stop]
@@ -1612,6 +1670,7 @@ class MultiGPUKLTParticleDetector3D:
     def _score_candidates_with_streamed_template_chunks(
         self,
         templates: npt.NDArray[np.generic],
+        active_template_indices: npt.NDArray[np.int64],
         normalization: npt.NDArray[np.float32],
         score_weights: npt.NDArray[np.float32],
         score_offset: np.float32,
@@ -1657,7 +1716,7 @@ class MultiGPUKLTParticleDetector3D:
                 "template_chunk_size_per_device": chunk_size,
                 "template_chunk_count": chunk_count,
                 "templates_per_device": templates_per_device,
-                "template_count": int(templates.shape[0]),
+                "template_count": int(active_template_indices.size),
                 "subvolume_count": self.processor.subvolume_count,
             }
         )
@@ -1665,7 +1724,7 @@ class MultiGPUKLTParticleDetector3D:
         LOGGER.info(
             "Streamed KLT scoring: templates=%d | local=%d | chunk=%d | "
             "chunks/subvolume=%d | batch=%d | FFT=%s | subvolumes=%d",
-            templates.shape[0],
+            active_template_indices.size,
             templates_per_device,
             chunk_size,
             chunk_count,
@@ -1734,16 +1793,15 @@ class MultiGPUKLTParticleDetector3D:
                     global_stop = min(
                         global_start + chunk_size,
                         (device_index + 1) * templates_per_device,
-                        templates.shape[0],
+                        active_template_indices.size,
                     )
                     count = max(0, global_stop - global_start)
                     if count == chunk_size:
-                        # A full memmap slice is already contiguous and has the
-                        # transfer dtype. Avoid copying every multi-GiB chunk
-                        # through a second pageable host buffer.
-                        template_shard = np.asarray(
-                            templates[global_start:global_stop],
-                            dtype=np.complex64,
+                        # Preserve a zero-copy memmap view when the retained
+                        # physical rows form one contiguous run.
+                        template_shard = _take_template_rows(
+                            templates,
+                            active_template_indices[global_start:global_stop],
                         )
                         norm_shard = np.asarray(
                             normalization[global_start:global_stop],
@@ -1761,9 +1819,10 @@ class MultiGPUKLTParticleDetector3D:
                         norm_shard = np.zeros(chunk_size, dtype=np.float32)
                         weight_shard = np.zeros(chunk_size, dtype=np.float32)
                         if count:
-                            template_shard[:count] = templates[
-                                global_start:global_stop
-                            ]
+                            template_shard[:count] = _take_template_rows(
+                                templates,
+                                active_template_indices[global_start:global_stop],
+                            )
                             norm_shard[:count] = normalization[
                                 global_start:global_stop
                             ]

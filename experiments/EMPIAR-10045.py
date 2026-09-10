@@ -55,7 +55,8 @@ DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045-bandpass-block-qr"
 
 LOGGER = logging.getLogger("empiar-10045")
 T = TypeVar("T")
-_SCORE_MODEL_METHOD = "block_qr_nonnegative_m_v3_fourier_normalized"
+_TEMPLATE_MODEL_METHOD = "linear_mass_preserving_psd_v2"
+_SCORE_MODEL_METHOD = "block_qr_nonnegative_m_v4_mass_preserving_psd"
 
 
 def parse_args() -> argparse.Namespace:
@@ -767,7 +768,7 @@ def main() -> None:
                 "whitening_support_radius": args.whitening_support_radius,
                 "bandpass_low_fraction": args.bandpass_low_fraction,
                 "bandpass_high_fraction": args.bandpass_high_fraction,
-                "score_basis": "distributed_block_qr_nonnegative_m_v3",
+                "score_basis": "distributed_block_qr_nonnegative_m_v4",
                 "template_side": detector.model.template_side,
                 "fredholm_radius_voxels": detector.model.fredholm_radius_voxels,
                 "max_order": detector.model.max_order,
@@ -928,6 +929,9 @@ def main() -> None:
                 with np.load(template_metadata_path, allow_pickle=False) as metadata:
                     template_checkpoint_compatible = (
                         "inverse_fourier_normalization_3d" in metadata
+                        and "template_model_method" in metadata
+                        and metadata["template_model_method"].item()
+                        == _TEMPLATE_MODEL_METHOD
                         and np.isclose(
                             metadata["inverse_fourier_normalization_3d"].item(),
                             INVERSE_FOURIER_NORMALIZATION_3D,
@@ -980,12 +984,13 @@ def main() -> None:
                 ):
                     if not args.overwrite:
                         raise RuntimeError(
-                            "stage-6 checkpoint uses the legacy Fourier scale; "
+                            "stage-6 checkpoint uses an incompatible template "
+                            "model; "
                             "pass --resume --overwrite to rebuild stage 6 onward"
                         )
                     LOGGER.warning(
-                        "Stage-6 checkpoint predates corrected Fourier "
-                        "normalization; rebuilding templates and eigenvalues"
+                        "Stage-6 checkpoint predates the current normalized "
+                        "PSD interpolation; rebuilding templates and eigenvalues"
                     )
                 require_replaceable(
                     (templates_path, template_metadata_path),
@@ -1021,6 +1026,7 @@ def main() -> None:
                     template_multiplicities=(
                         detector.model.template_multiplicities
                     ),
+                    template_model_method=np.asarray(_TEMPLATE_MODEL_METHOD),
                     available_radial_mode_count=np.asarray(
                         detector.model.available_radial_mode_count
                     ),
@@ -1227,12 +1233,12 @@ def main() -> None:
                 ):
                     if not args.overwrite:
                         raise RuntimeError(
-                            "stage-6b checkpoint uses the legacy likelihood "
-                            "scale; pass --resume --overwrite to rebuild stage "
+                            "stage-6b checkpoint uses an incompatible likelihood "
+                            "model; pass --resume --overwrite to rebuild stage "
                             "6b onward"
                         )
                     LOGGER.warning(
-                        "Stage-6b checkpoint uses the legacy likelihood scale; "
+                        "Stage-6b checkpoint uses an incompatible likelihood model; "
                         "rebuilding block-QR score parameters"
                     )
                 require_replaceable(

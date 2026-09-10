@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -129,6 +130,25 @@ def fit_streamed_rpsds(
     mean_patch_variance = float(np.mean(variances))
 
     selected_device = jax.devices()[0] if device is None else device
+    LOGGER.info(
+        "ALS FIT START | samples=%d | radial frequencies=%d | max iterations=%d | "
+        "tolerance=%.3g | device=%s",
+        extraction.rpsds.shape[0],
+        extraction.rpsds.shape[1],
+        max_iterations,
+        convergence_tolerance,
+        selected_device,
+    )
+    LOGGER.info(
+        "ALS CALIBRATION INPUT | noise patches=%d/%d (lowest %.1f%%) | "
+        "noise variance=%.8g | mean patch variance=%.8g",
+        noise_patch_count,
+        variances.size,
+        100 * _NOISE_PATCH_FRACTION,
+        noise_variance,
+        mean_patch_variance,
+    )
+    started = time.monotonic()
     with jax.default_device(selected_device):
         factorization = alternating_least_squares_solver(
             jnp.asarray(extraction.rpsds),
@@ -137,12 +157,57 @@ def fit_streamed_rpsds(
         )
         particle_psd = np.asarray(factorization.gamma)
         noise_psd = np.asarray(factorization.v)
+        weights = np.asarray(factorization.alpha)
+        iterations = int(np.asarray(factorization.iter_num))
+        previous_particle_psd = np.asarray(factorization.gamma_prev)
+        previous_noise_psd = np.asarray(factorization.v_prev)
+        previous_weights = np.asarray(factorization.alpha_prev)
+
+    def relative_change(
+        current: npt.NDArray[np.generic],
+        previous: npt.NDArray[np.generic],
+    ) -> float:
+        denominator = max(float(np.linalg.norm(current)), np.finfo(float).tiny)
+        return float(np.linalg.norm(current - previous) / denominator)
+
+    particle_change = relative_change(particle_psd, previous_particle_psd)
+    noise_change = relative_change(noise_psd, previous_noise_psd)
+    weight_change = relative_change(weights, previous_weights)
+    maximum_change = max(particle_change, noise_change, weight_change)
+    LOGGER.info(
+        "ALS FIT DONE | iterations=%d/%d | converged=%s | elapsed=%.3f s | "
+        "relative changes: particle=%.3g noise=%.3g weights=%.3g max=%.3g",
+        iterations,
+        max_iterations,
+        maximum_change < convergence_tolerance,
+        time.monotonic() - started,
+        particle_change,
+        noise_change,
+        weight_change,
+        maximum_change,
+    )
+    LOGGER.info(
+        "ALS WEIGHTS | min=%.6g | mean=%.6g | max=%.6g | "
+        "zero fraction=%.4f | one fraction=%.4f",
+        float(np.min(weights)),
+        float(np.mean(weights)),
+        float(np.max(weights)),
+        float(np.mean(weights == 0)),
+        float(np.mean(weights == 1)),
+    )
     particle_psd, noise_psd = calibrate_radial_psds(
         extraction.radial_points,
         particle_psd,
         noise_psd,
         noise_variance,
         mean_patch_variance,
+    )
+    LOGGER.info(
+        "ALS CALIBRATION DONE | particle PSD norm=%.8g | noise PSD norm=%.8g | "
+        "noise variance=%.8g",
+        float(np.linalg.norm(particle_psd)),
+        float(np.linalg.norm(noise_psd)),
+        noise_variance,
     )
     return CalibratedRpsdModel(
         particle_psd=particle_psd,
@@ -294,12 +359,13 @@ def distributed_block_qr_score_parameters(
     """Compute independent QR likelihood bases for ``m >= 0`` blocks.
 
     Same-width blocks are dispatched independently across the selected devices.
-    ``host_qr`` uses NumPy/LAPACK for systems whose GPU backend does not support
-    complex QR. No Gram-matrix precheck is performed: block QR is the scoring
-    definition. Cross-block orthogonality follows the spherical-harmonic
-    construction. Positive-``m`` weights and likelihood-offset terms receive
-    multiplicity two because their omitted negative-``m`` partners have
-    conjugate responses for a real tomogram.
+    ``host_qr`` uses NumPy/LAPACK for all blocks. GPU QR failures are handled
+    automatically by recomputing only the failed block with host LAPACK and
+    routing the remaining blocks to the host. No Gram-matrix precheck is
+    performed: block QR is the scoring definition. Cross-block orthogonality
+    follows the spherical-harmonic construction. Positive-``m`` weights and
+    likelihood-offset terms receive multiplicity two because their omitted
+    negative-``m`` partners have conjugate responses for a real tomogram.
     """
     template_array = np.asanyarray(templates)
     eigenvalues = np.asarray(template_eigenvalues, dtype=np.float32)
@@ -375,7 +441,44 @@ def distributed_block_qr_score_parameters(
             (indices, output_indices, multiplicity)
         )
 
+    def host_block_result(
+        indices: npt.NDArray[np.int64],
+        width: int,
+    ) -> tuple[
+        npt.NDArray[np.complex64],
+        npt.NDArray[np.float32],
+        np.float32,
+        npt.NDArray[np.float64],
+    ]:
+        host_templates = np.asarray(
+            template_array[indices],
+            dtype=np.complex64,
+        ).reshape(width, voxel_count).T
+        return _host_qr_score_block(
+            host_templates,
+            eigenvalues[indices],
+            float(noise_variance),
+        )
+
+    def store_block_result(
+        output_indices: npt.NDArray[np.int64],
+        multiplicity: float,
+        width: int,
+        result: tuple[npt.ArrayLike, npt.ArrayLike, npt.ArrayLike, npt.ArrayLike],
+    ) -> float:
+        basis_block, weight_block, offset, eigenvalue_block = (
+            np.asarray(value) for value in result
+        )
+        score_templates[output_indices] = basis_block.reshape(
+            width,
+            *template_array.shape[1:],
+        )
+        score_weights[output_indices] = multiplicity * weight_block
+        signal_eigenvalues[output_indices] = eigenvalue_block
+        return multiplicity * float(offset)
+
     total_offset = 0.0
+    gpu_qr_disabled = False
     for width, blocks in sorted(blocks_by_width.items()):
         LOGGER.info(
             "Block QR: radial width=%d | angular blocks=%d | devices=%d",
@@ -383,30 +486,23 @@ def distributed_block_qr_score_parameters(
             len(blocks),
             len(selected_devices),
         )
-        if host_qr:
+        if host_qr or gpu_qr_disabled:
+            host_description = (
+                f"Host block QR width={width}"
+                if host_qr
+                else f"Host fallback QR width={width}"
+            )
             for indices, output_indices, multiplicity in tqdm(
                 blocks,
-                desc=f"Host block QR width={width}",
+                desc=host_description,
                 unit="block",
             ):
-                host_templates = np.asarray(
-                    template_array[indices],
-                    dtype=np.complex64,
-                ).reshape(width, voxel_count).T
-                basis_block, weight_block, offset, eigenvalue_block = (
-                    _host_qr_score_block(
-                        host_templates,
-                        eigenvalues[indices],
-                        float(noise_variance),
-                    )
-                )
-                score_templates[output_indices] = basis_block.reshape(
+                total_offset += store_block_result(
+                    output_indices,
+                    multiplicity,
                     width,
-                    *template_array.shape[1:],
+                    host_block_result(indices, width),
                 )
-                score_weights[output_indices] = multiplicity * weight_block
-                signal_eigenvalues[output_indices] = eigenvalue_block
-                total_offset += multiplicity * float(offset)
             continue
         compiled_qr = jax.jit(
             partial(_qr_score_block, noise_variance=float(noise_variance)),
@@ -424,35 +520,80 @@ def distributed_block_qr_score_parameters(
             for slot, (indices, output_indices, multiplicity) in enumerate(
                 round_blocks
             ):
+                if gpu_qr_disabled:
+                    pending_results.append(
+                        (indices, output_indices, multiplicity, None, "host")
+                    )
+                    continue
                 host_templates = np.asarray(
                     template_array[indices],
                     dtype=np.complex64,
                 ).reshape(width, voxel_count).T
                 device = selected_devices[slot]
-                device_templates = jax.device_put(host_templates, device)
-                device_eigenvalues = jax.device_put(eigenvalues[indices], device)
-                pending_results.append(
-                    (
-                        output_indices,
-                        multiplicity,
-                        compiled_qr(device_templates, device_eigenvalues),
+                try:
+                    device_templates = jax.device_put(host_templates, device)
+                    device_eigenvalues = jax.device_put(eigenvalues[indices], device)
+                    device_result = compiled_qr(
+                        device_templates,
+                        device_eigenvalues,
                     )
+                except RuntimeError as error:
+                    gpu_qr_disabled = True
+                    LOGGER.warning(
+                        "GPU block QR dispatch failed; using host LAPACK for "
+                        "this and all remaining blocks | width=%d | ell=%d | "
+                        "m=%d | device=%s | error=%s: %s",
+                        width,
+                        int(orders[indices[0]]),
+                        int(m_values[indices[0]]),
+                        device,
+                        type(error).__name__,
+                        error,
+                    )
+                    device_result = None
+                pending_results.append(
+                    (indices, output_indices, multiplicity, device_result, device)
                 )
 
             # JAX dispatch is asynchronous. Launch every independent block
             # before gathering any result so the selected GPUs work in
             # parallel without a replicated pmap computation or collectives.
-            for output_indices, multiplicity, device_result in pending_results:
-                basis_block, weight_block, offset, eigenvalue_block = (
-                    np.asarray(value) for value in device_result
-                )
-                score_templates[output_indices] = basis_block.reshape(
+            for (
+                indices,
+                output_indices,
+                multiplicity,
+                device_result,
+                device,
+            ) in pending_results:
+                if device_result is not None:
+                    try:
+                        total_offset += store_block_result(
+                            output_indices,
+                            multiplicity,
+                            width,
+                            device_result,
+                        )
+                        continue
+                    except RuntimeError as error:
+                        gpu_qr_disabled = True
+                        LOGGER.warning(
+                            "GPU block QR execution failed; recomputing this "
+                            "block with host LAPACK and routing all remaining "
+                            "blocks to the host | width=%d | ell=%d | m=%d | "
+                            "device=%s | error=%s: %s",
+                            width,
+                            int(orders[indices[0]]),
+                            int(m_values[indices[0]]),
+                            device,
+                            type(error).__name__,
+                            error,
+                        )
+                total_offset += store_block_result(
+                    output_indices,
+                    multiplicity,
                     width,
-                    *template_array.shape[1:],
+                    host_block_result(indices, width),
                 )
-                score_weights[output_indices] = multiplicity * weight_block
-                signal_eigenvalues[output_indices] = eigenvalue_block
-                total_offset += multiplicity * float(offset)
     return (
         score_templates,
         score_weights,
@@ -804,6 +945,7 @@ def finalize_klt_score_shards_and_extract_candidates(
     *,
     core_shape: tuple[int, int, int],
     source_shape: tuple[int, int, int],
+    whitening_radius: int,
     template_radius: int,
     candidate_capacity: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -817,7 +959,9 @@ def finalize_klt_score_shards_and_extract_candidates(
             region_start,
             core_shape=core_shape,
             source_shape=source_shape,
-            template_radius=template_radius,
+            valid_radius=(
+                whitening_radius + template_radius + _LOCAL_MAXIMUM_RADIUS
+            ),
             candidate_capacity=candidate_capacity,
         )
 
@@ -842,7 +986,7 @@ def extract_score_candidates(
     *,
     core_shape: tuple[int, int, int],
     source_shape: tuple[int, int, int],
-    template_radius: int,
+    valid_radius: int,
     candidate_capacity: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return the ranked 3x3x3 local maxima from one owned score core."""
@@ -857,8 +1001,8 @@ def extract_score_candidates(
             - score_halo
         )
         axis_valid = (
-            (global_axis >= template_radius)
-            & (global_axis < source_shape[axis] - template_radius)
+            (global_axis >= valid_radius)
+            & (global_axis < source_shape[axis] - valid_radius)
         )
         reshape = [1, 1, 1]
         reshape[axis] = haloed_scores.shape[axis]
@@ -943,7 +1087,9 @@ def score_subvolume_candidates(
         region_start,
         core_shape=core_shape,
         source_shape=source_shape,
-        template_radius=template_radius,
+        valid_radius=(
+            whitening_radius + template_radius + _LOCAL_MAXIMUM_RADIUS
+        ),
         candidate_capacity=candidate_capacity,
     )
 
@@ -988,7 +1134,9 @@ def score_template_shards_and_extract_candidates(
             region_start,
             core_shape=core_shape,
             source_shape=source_shape,
-            template_radius=template_radius,
+            valid_radius=(
+                whitening_radius + template_radius + _LOCAL_MAXIMUM_RADIUS
+            ),
             candidate_capacity=candidate_capacity,
         )
 
@@ -1613,8 +1761,9 @@ class MultiGPUKLTParticleDetector3D:
         total_local_maxima = 0
         retained_local_maxima = 0
         truncated_subvolumes = 0
-        valid_lower = np.full(3, template_radius)
-        valid_upper = np.asarray(self.source.shape) - template_radius
+        valid_radius = total_halo
+        valid_lower = np.full(3, valid_radius)
+        valid_upper = np.asarray(self.source.shape) - valid_radius
         for region in tqdm(
             self.processor.regions(),
             total=self.processor.subvolume_count,
@@ -1756,6 +1905,7 @@ class MultiGPUKLTParticleDetector3D:
                 finalize_klt_score_shards_and_extract_candidates,
                 core_shape=self.processor.core_shape,
                 source_shape=self.source.shape,
+                whitening_radius=whitening_radius,
                 template_radius=template_radius,
                 candidate_capacity=candidate_capacity,
             ),
@@ -1768,8 +1918,9 @@ class MultiGPUKLTParticleDetector3D:
         total_local_maxima = 0
         retained_local_maxima = 0
         truncated_subvolumes = 0
-        valid_lower = np.full(3, template_radius)
-        valid_upper = np.asarray(self.source.shape) - template_radius
+        valid_radius = total_halo
+        valid_lower = np.full(3, valid_radius)
+        valid_upper = np.asarray(self.source.shape) - valid_radius
 
         for region in tqdm(
             self.processor.regions(),

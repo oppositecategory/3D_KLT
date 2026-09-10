@@ -28,7 +28,6 @@ from kltpicker_3d.utils import (
     radial_average_jax,
     radial_mode_truncation_index,
     ranked_local_maxima_nms_3d,
-    trigonometric_interpolation,
 )
 
 _ALS_CONVERGENCE_TOLERANCE = 1e-4
@@ -50,6 +49,59 @@ def _odd_floor(value: float) -> int:
     """Return the largest odd integer not greater than ``value``."""
     size = int(np.floor(value))
     return size if size % 2 else size - 1
+
+
+def _interpolate_particle_psd_for_fredholm(
+    radial_points: npt.ArrayLike,
+    particle_psd: npt.ArrayLike,
+    quadrature_nodes: npt.ArrayLike,
+    quadrature_weights: npt.ArrayLike,
+) -> npt.NDArray[np.float64]:
+    """Interpolate a nonnegative PSD without changing its radial mass.
+
+    A PSD sampled on ``[0, pi]`` is not periodic. Trigonometric interpolation
+    therefore rings at its cutoffs; clipping the negative lobes then changes
+    the covariance trace. Linear interpolation is shape preserving, and the
+    final scalar correction makes its ``rho**2``-weighted Gauss--Legendre mass
+    exactly match the calibrated sampled PSD.
+    """
+    points = np.asarray(radial_points, dtype=np.float64)
+    spectrum = np.asarray(particle_psd, dtype=np.float64)
+    nodes = np.asarray(quadrature_nodes, dtype=np.float64)
+    weights = np.asarray(quadrature_weights, dtype=np.float64)
+    if points.ndim != 1 or spectrum.shape != points.shape:
+        raise ValueError("radial PSD samples must be equal-length vectors")
+    if nodes.ndim != 1 or weights.shape != nodes.shape:
+        raise ValueError(
+            "quadrature nodes and weights must be equal-length vectors"
+        )
+    if np.any(np.diff(points) <= 0) or np.any(spectrum < 0):
+        raise ValueError("radial PSD samples must be ordered and nonnegative")
+    if nodes.size < 1 or nodes[0] < points[0] or nodes[-1] > points[-1]:
+        raise ValueError(
+            "quadrature nodes must lie inside the sampled PSD interval"
+        )
+
+    interpolated = np.interp(nodes, points, spectrum)
+    source_integrand = spectrum * points**2
+    source_mass = np.sum(
+        0.5
+        * (source_integrand[:-1] + source_integrand[1:])
+        * np.diff(points)
+    )
+    # roots_legendre weights integrate on [-1, 1]; nodes were mapped to the
+    # sampled interval, so include that mapping's Jacobian here.
+    interval_jacobian = (points[-1] - points[0]) / 2
+    interpolated_mass = interval_jacobian * np.sum(
+        weights * interpolated * nodes**2
+    )
+    scale = max(1.0, abs(source_mass), abs(interpolated_mass))
+    tolerance = np.finfo(np.float64).eps * scale
+    if source_mass <= tolerance:
+        return np.zeros_like(interpolated)
+    if interpolated_mass <= tolerance:
+        raise ValueError("interpolated particle PSD has zero radial mass")
+    return interpolated * (source_mass / interpolated_mass)
 
 
 def _extract_nonoverlapping_patches(
@@ -340,17 +392,13 @@ class KLTParticleDetector3D:
         npt.NDArray[np.float64],
     ]:
         """Interpolate the particle PSD and solve every angular order."""
-        legendre_nodes, _ = roots_legendre(self.legendre_order)
+        legendre_nodes, legendre_weights = roots_legendre(self.legendre_order)
         frequency_nodes = (self.bandlimit / 2) * (legendre_nodes + 1)
-        particle_psd_nodes = np.maximum(
-            np.asarray(
-                trigonometric_interpolation(
-                    self.uniform_points,
-                    particle_psd,
-                    frequency_nodes,
-                )
-            ),
-            0,
+        particle_psd_nodes = _interpolate_particle_psd_for_fredholm(
+            self.uniform_points,
+            particle_psd,
+            frequency_nodes,
+            legendre_weights,
         )
 
         eigenvalue_blocks = []

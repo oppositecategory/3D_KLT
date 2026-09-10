@@ -655,7 +655,11 @@ def compare_candidates(
             extract_score_candidates,
             core_shape=tuple(manifest["core_shape"]),
             source_shape=tuple(manifest["volume_shape_zyx"]),
-            template_radius=int(manifest["template_side"]) // 2,
+            valid_radius=(
+                int(manifest["whitening_support_radius"])
+                + int(manifest["template_side"]) // 2
+                + 1
+            ),
             candidate_capacity=candidate_capacity,
         )
     )

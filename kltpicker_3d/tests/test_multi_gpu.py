@@ -5,6 +5,7 @@ from numpy.testing import assert_allclose, assert_array_equal
 from scipy import ndimage
 from scipy.signal import fftconvolve
 
+import kltpicker_3d.multi_gpu as multi_gpu_module
 from kltpicker_3d.multi_gpu import (
     MultiGPUKLTParticleDetector3D,
     compute_fused_klt_score_shard,
@@ -48,13 +49,32 @@ def test_candidate_top_k_reports_full_count_and_retains_only_capacity():
         jnp.full(3, 5, dtype=jnp.int32),
         core_shape=(5, 5, 5),
         source_shape=(20, 20, 20),
-        template_radius=0,
+        valid_radius=0,
         candidate_capacity=1,
     )
 
     assert int(count) == 2
     assert_array_equal(np.asarray(coordinates), np.array([[1, 1, 1]]))
     assert_allclose(np.asarray(values), np.array([3], dtype=np.float32))
+
+
+def test_candidate_extraction_rejects_incomplete_composed_support():
+    scores = np.zeros((7, 7, 7), dtype=np.float32)
+    scores[2, 2, 2] = 3
+    scores[4, 4, 4] = 2
+
+    coordinates, values, count = extract_score_candidates(
+        jnp.asarray(scores),
+        jnp.zeros(3, dtype=jnp.int32),
+        core_shape=(5, 5, 5),
+        source_shape=(20, 20, 20),
+        valid_radius=3,
+        candidate_capacity=2,
+    )
+
+    assert int(count) == 1
+    assert_array_equal(np.asarray(coordinates[0]), np.array([3, 3, 3]))
+    assert_allclose(np.asarray(values[0]), 2)
 
 
 def test_distributed_block_qr_preserves_each_signal_covariance():
@@ -101,6 +121,47 @@ def test_distributed_block_qr_preserves_each_signal_covariance():
         np.sum(np.log1p(transformed_eigenvalues / 0.8)),
         rtol=2e-5,
     )
+
+
+def test_distributed_block_qr_falls_back_after_gpu_runtime_error(monkeypatch):
+    rng = np.random.default_rng(456)
+    templates = (
+        rng.standard_normal((4, 3, 3, 3))
+        + 1j * rng.standard_normal((4, 3, 3, 3))
+    ).astype(np.complex64)
+    eigenvalues = np.array([4.0, 1.5, 3.0, 0.5], dtype=np.float32)
+    orders = np.array([0, 0, 1, 1])
+    m_values = np.zeros(4, dtype=np.int64)
+    arguments = (
+        templates,
+        eigenvalues,
+        orders,
+        m_values,
+        0.8,
+    )
+    expected = distributed_block_qr_score_parameters(
+        *arguments,
+        devices=(jax.devices()[0],),
+        host_qr=True,
+    )
+
+    def failing_jit(function):
+        del function
+
+        def fail_at_dispatch(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("simulated unsupported GPU QR")
+
+        return fail_at_dispatch
+
+    monkeypatch.setattr(multi_gpu_module.jax, "jit", failing_jit)
+    actual = distributed_block_qr_score_parameters(
+        *arguments,
+        devices=(jax.devices()[0],),
+    )
+
+    for actual_array, expected_array in zip(actual, expected):
+        assert_allclose(actual_array, expected_array, rtol=2e-5, atol=2e-5)
 
 
 def test_nonnegative_m_scoring_matches_explicit_conjugate_pairs():
@@ -456,6 +517,16 @@ def test_streamed_candidates_match_complete_volume_scoring():
         )
         complete_score += weight * np.square(np.abs(response))
     complete_score -= offset
+
+    complete_coordinates = (
+        np.indices(complete_score.shape).transpose(1, 2, 3, 0) + 1
+    )
+    valid = np.all(
+        (complete_coordinates >= 3)
+        & (complete_coordinates < np.asarray(volume.shape) - 3),
+        axis=-1,
+    )
+    complete_score = np.where(valid, complete_score, -np.inf)
 
     maximum = ndimage.maximum_filter(
         complete_score,
